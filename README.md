@@ -3,7 +3,8 @@ A Telegram bot to track activity of trustworthy bitcoin traders
 
 To run the bot yourself, you will need: 
 - Python (tested with 3.4)
-- The [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) module (tested with 4.2.0)
+- The [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) module (dev version)
+  - Install with `pip install https://github.com/python-telegram-bot/python-telegram-bot/archive/user-storage.zip`
 - The [Pony ORM](https://ponyorm.com/) module (tested with 0.6.4)
 
 Get a bot token from [@BotFather](http://telegram.me/BotFather), place it in `credentials.py`. If you want to use [botan.io](http://botan.io/) for bot analyis, get a token from [@Botaniobot](http://telegram.me/Botaniobot) and also place it in `credentials.py`.
