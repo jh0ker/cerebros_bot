@@ -3,7 +3,7 @@ from datetime import datetime
 from io import BytesIO, BufferedReader
 
 from telegram.ext import Updater, CommandHandler, RegexHandler, \
-    MessageHandler, Filters, CallbackQueryHandler
+    MessageHandler, Filters, CallbackQueryHandler, ConversationHandler
 from telegram.ext.dispatcher import run_async
 from telegram import ParseMode, ReplyKeyboardMarkup, ReplyKeyboardHide, \
     ChatAction, ForceReply, InlineKeyboardMarkup, InlineKeyboardButton, Emoji
@@ -19,9 +19,7 @@ from believer import Believer
 from reporter import Reporter
 
 # States the bot can have (maintained per chat id)
-MAIN, ADD_BELIEVER, REMOVE_BELIEVER, ADD_ADMIN, REMOVE_ADMIN, PHONE_NR,\
-    ACCOUNT_NR, BANK_NAME, REMARK, SEARCH, ADD_INFO, EDIT, ATTACHMENT =\
-    range(13)
+ADD, REMOVE, EDIT, WAIT, PHONE_NR, ACCOUNT_NR, BANK_NAME, REMARK, ATTACHMENT = range(9)
 
 options = {PHONE_NR: "Phone number", ACCOUNT_NR: "Telegram ID",
            BANK_NAME: "Name of bank account owner", REMARK: "DNA",
@@ -40,8 +38,6 @@ _grid = [[options[ACCOUNT_NR]],
 
 CAT_KEYBOARD = ReplyKeyboardMarkup(_grid, selective=True)
 DB_NAME = 'bot.sqlite'
-
-state = dict()
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -92,13 +88,11 @@ def error(bot, update, error):
     logger.exception(error)
 
 
+@db_session
 def help(bot, update):
     """ Handler for the /help command """
     from_user = update.message.from_user
-    chat_id = update.message.chat_id
-
-    with db_session:
-        admin = get_admin(from_user)
+    admin = get_admin(from_user)
 
     text = help_text
 
@@ -107,10 +101,7 @@ def help(bot, update):
         if admin.super_admin:
             text += super_admin_help_text
 
-    bot.sendMessage(chat_id,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True)
+    update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
 def get_admin(from_user):
@@ -131,216 +122,83 @@ def get_reporter(from_user):
     return reporter
 
 
-def message_handler(bot, update):
-    global state
-    forward_from = update.message.forward_from
-    chat_id = update.message.chat_id
-    chat_state = state.get(chat_id, MAIN)
-    reply = None
-    reply_markup = ReplyKeyboardHide(selective=True)
-
-    with db_session:
-        if chat_state is ADD_BELIEVER and forward_from:
-            reporter = get_reporter(forward_from)
-            if not reporter:
-                reporter = Reporter(id=forward_from.id,
-                                    first_name=forward_from.first_name,
-                                    last_name=forward_from.last_name,
-                                    username=forward_from.username)
-                track(update, 'new_reporter')
-
-            believer = Believer(added_by=get_admin(update.message.from_user))
-            believer.reported_by.add(reporter)
-            track(update, 'new_report')
-            db.commit()
-
-            reply = "Created report <b>#%d</b>! Please enter trustworthy bitcoin trader " \
-                    "information:" % believer.id
-            reply_markup = CAT_KEYBOARD
-            state[chat_id] = [ADD_INFO, believer.id]
-
-        elif chat_state is EDIT:
-            try:
-                report_id = int(update.message.text.replace('#', ''))
-            except ValueError:
-                reply = "Not a valid report number. Try again or use " \
-                        "/cancel to abort."
-            else:
-                believer = Believer.get(id=report_id)
-
-                if believer:
-                    reply = "%s\n\nPlease enter new " \
-                            "trustworthy bitcoin trader information:" % str(believer)
-                    reply_markup = CAT_KEYBOARD
-                    state[chat_id] = [ADD_INFO, believer.id]
-                else:
-                    reply = "Could not find report number. Try again or " \
-                            "use /cancel to abort."
-
-        elif chat_state is REMOVE_BELIEVER:
-            try:
-                report_id = int(update.message.text.replace('#', ''))
-            except ValueError:
-                reply = "Not a valid report number. Try again or use " \
-                        "/cancel to abort."
-            else:
-                believer = Believer.get(id=report_id)
-                if believer:
-                    believer.delete()
-                    reply = "Deleted report!"
-                    del state[chat_id]
-                else:
-                    reply = "Could not find report number. Try again or " \
-                            "use /cancel to abort."
-                    reply_markup = ForceReply(selective=True)
-
-        elif chat_state is ADD_ADMIN and forward_from:
-            admin = get_admin(forward_from)
-            if not admin:
-                Admin(id=forward_from.id,
-                      first_name=forward_from.first_name,
-                      last_name=forward_from.last_name,
-                      username=forward_from.username)
-                reply = "Successfully added admin"
-            else:
-                reply = "This user is already an admin"
-
-            del state[chat_id]
-
-        elif chat_state is REMOVE_ADMIN and forward_from:
-            admin = get_admin(forward_from)
-            if admin and not admin.super_admin:
-                admin.delete()
-                reply = "Successfully removed admin"
-            else:
-                reply = "This user is not an admin"
-
-            del state[chat_id]
-
-        elif (isinstance(chat_state, tuple) and
-              chat_state[0] is SEARCH and
-              update.message.text):
-
-            issued = chat_state[1]
-            if (datetime.now() - issued).seconds > 30:
-                reply = "Please send your /search query within 30 seconds."
-                del state[chat_id]
-
-            else:
-                text = update.message.text.replace('%', '')
-
-                believers = select(
-                    s for s in Believer if
-                    text in s.phone_nr or
-                    text in s.account_nr or
-                    text in s.bank_name or
-                    text in s.remark
-                ).order_by(
-                    desc(Believer.created)
-                )[0:1]
-
-                if believers:
-                    believer = believers[0]
-                    reply = str(believer)
-                    reporter = get_reporter(update.message.from_user)
-
-                    kb = search_keyboard(offset=0,
-                                         show_download=True,
-                                         disabled_attachments=[],
-                                         confirmed=reporter in believer.reported_by
-                                         if reporter
-                                         else False,
-                                         query=text)
-                    reply_markup = InlineKeyboardMarkup(kb)
-                else:
-                    reply = "No search results"
-
-                del state[chat_id]
-                track(update, 'search')
-
-        elif isinstance(chat_state, list):  # Additional info
-            text = update.message.text
-
-            if chat_state[0] is ADD_INFO and len(chat_state) is 2:
-                option = options[text]
-                chat_state.append(option)
-                state[chat_id] = chat_state
-
-                if option != ATTACHMENT:
-                    reply = "Please enter " + update.message.text
-                else:
-                    reply = "Please send a photo or file to attach to this " \
-                            "report"
-
-                reply_markup = ForceReply(selective=True)
-
-            elif chat_state[0] is ADD_INFO:
-                    believer = Believer.get(id=chat_state[1])
-                    text = update.message.text
-                    category = chat_state[2]
-
-                    if category is PHONE_NR and text:
-                        believer.phone_nr = text
-
-                    elif category is ACCOUNT_NR and text:
-                        believer.account_nr = text
-
-                    elif category is BANK_NAME and text:
-                        believer.bank_name = text
-
-                    elif category is REMARK and text:
-                        believer.remark = text
-
-                    elif category is ATTACHMENT:
-                        if update.message.photo:
-                            believer.attached_file =\
-                                'photo:' + update.message.photo[-1].file_id
-                        elif update.message.document:
-                            believer.attached_file =\
-                                'document:' + update.message.document.file_id
-
-                    chat_state.pop()  # one menu back
-                    state[chat_id] = chat_state
-                    reply_markup = CAT_KEYBOARD
-                    reply = "Add more info or send /cancel if you're done."
-
-    if reply:
-        bot.sendMessage(chat_id, text=reply, parse_mode=ParseMode.HTML,
-                        reply_to_message_id=update.message.message_id,
-                        reply_markup=reply_markup)
-
-
 @run_async
 def track(update, event_name):
     if botan:
         botan.track(message=update.message, event_name=event_name)
 
 
+@db_session
 def add_believer(bot, update):
-    global state
-    with db_session:
-        admin = get_admin(update.message.from_user)
+    admin = get_admin(update.message.from_user)
+
     if not admin:
-        return
-    state[update.message.chat_id] = ADD_BELIEVER
-    bot.sendMessage(update.message.chat_id,
-                    text="Forward me a message of the user that is reporting "
-                         "the trustworthy bitcoin trader or use /cancel to cancel",
-                    reply_to_message_id=update.message.message_id)
+        return ConversationHandler.END
+
+    update.message.reply_text("Forward me a message of the user that is reporting the trustworthy "
+                              "bitcoin trader or use /cancel to cancel")
+
+    return ADD
 
 
+@db_session
+def add_believer_2(bot, update, user_data):
+    forward_from = update.message.forward_from
+    reporter = get_reporter(forward_from)
+
+    if not reporter:
+        reporter = Reporter(id=forward_from.id,
+                            first_name=forward_from.first_name,
+                            last_name=forward_from.last_name,
+                            username=forward_from.username)
+        track(update, 'new_reporter')
+
+    believer = Believer(added_by=get_admin(update.message.from_user))
+    believer.reported_by.add(reporter)
+    track(update, 'new_report')
+    db.commit()
+
+    update.message.reply_text(
+        "Created report <b>#%d</b>! Please enter trustworthy bitcoin trader information:"
+        % believer.id,
+        reply_markup=CAT_KEYBOARD,
+        parse_mode=ParseMode.HTML)
+
+    user_data['id'] = believer.id
+    return EDIT
+
+
+@db_session
 def remove_believer(bot, update):
-    global state
-    with db_session:
-        admin = get_admin(update.message.from_user)
+    admin = get_admin(update.message.from_user)
+
     if not admin:
-        return
-    state[update.message.chat_id] = REMOVE_BELIEVER
-    bot.sendMessage(update.message.chat_id,
-                    text="Please send the Report # of the report you wish "
-                         "to remove or send /cancel to cancel",
-                    reply_markup=ForceReply(selective=True),
-                    reply_to_message_id=update.message.message_id)
+        return ConversationHandler.END
+
+    update.message.reply_text(
+        "Please send the Report # of the report you wish to remove or send /cancel to cancel",
+        reply_markup=ForceReply(selective=True))
+
+    return REMOVE
+
+
+@db_session
+def remove_believer_2(bot, update):
+    try:
+        report_id = int(update.message.text.replace('#', ''))
+    except ValueError:
+        update.message.reply_text("Not a valid report number. Try again or use /cancel to abort.")
+
+    else:
+        believer = Believer.get(id=report_id)
+        if believer:
+            believer.delete()
+            update.message.reply_text("Deleted report!")
+            return ConversationHandler.END
+        else:
+            update.message.reply_text(
+                "Could not find report number. Try again or use /cancel to abort.",
+                reply_markup=ForceReply(selective=True))
 
 
 def edit_believer(bot, update):
@@ -348,58 +206,224 @@ def edit_believer(bot, update):
     with db_session:
         admin = get_admin(update.message.from_user)
     if not admin:
-        return
-    state[update.message.chat_id] = EDIT
-    bot.sendMessage(update.message.chat_id,
-                    text="Please send the Report # of the report you wish "
-                         "to edit or send /cancel to cancel",
-                    reply_markup=ForceReply(selective=True),
-                    reply_to_message_id=update.message.message_id)
+        return ConversationHandler.END
+
+    update.message.reply_text(
+        "Please send the Report # of the report you wish to edit or send /cancel to cancel",
+        reply_markup=ForceReply(selective=True))
+
+    return WAIT
 
 
+@db_session
+def edit_believer_2(bot, update, user_data):
+    try:
+        believer_id = int(update.message.text.replace('#', ''))
+
+    except ValueError:
+        update.message.reply_text("Not a valid report number. Try again or use /cancel to abort.")
+
+    else:
+        believer = Believer.get(id=believer_id)
+
+        if believer:
+            update.message.reply_text(
+                "%s\n\nPlease enter new trustworthy bitcoin trader information:" % str(believer),
+                reply_markup=CAT_KEYBOARD)
+
+            user_data['id'] = believer.id
+            return EDIT
+
+        else:
+            update.message.reply_text(
+                "Could not find report number. Try again or use /cancel to abort.")
+
+
+@db_session
+def select_option(bot, update, user_data):
+    option = options[update.message.text]
+    user_data['option'] = option
+
+    if option != ATTACHMENT:
+        update.message.reply_text("Please enter " + update.message.text,
+                                  reply_markup=ForceReply(selective=True))
+    else:
+        update.message.reply_text("Please send a photo or file to attach to this report",
+                                  reply_markup=ForceReply(selective=True))
+
+    return option
+
+
+@db_session
+def edit_phone_nr(bot, update, user_data):
+    believer = Believer.get(id=user_data['id'])
+    believer.phone_nr = update.message.text
+
+    update.message.reply_text("Add more info or send /cancel if you're done.",
+                              reply_markup=CAT_KEYBOARD)
+
+    return EDIT
+
+
+@db_session
+def edit_account_nr(bot, update, user_data):
+    believer = Believer.get(id=user_data['id'])
+    believer.account_nr = update.message.text
+
+    update.message.reply_text("Add more info or send /cancel if you're done.",
+                              reply_markup=CAT_KEYBOARD)
+
+    return EDIT
+
+
+@db_session
+def edit_bank_name(bot, update, user_data):
+    believer = Believer.get(id=user_data['id'])
+    believer.bank_name = update.message.text
+
+    update.message.reply_text("Add more info or send /cancel if you're done.",
+                              reply_markup=CAT_KEYBOARD)
+
+    return EDIT
+
+
+@db_session
+def edit_remark(bot, update, user_data):
+    believer = Believer.get(id=user_data['id'])
+    believer.remark = update.message.text
+
+    update.message.reply_text("Add more info or send /cancel if you're done.",
+                              reply_markup=CAT_KEYBOARD)
+
+    return EDIT
+
+
+@db_session
+def edit_attachment(bot, update, user_data):
+    believer = Believer.get(id=user_data['id'])
+
+    if update.message.photo:
+        believer.attached_file = \
+            'photo:' + update.message.photo[-1].file_id
+    elif update.message.document:
+        believer.attached_file = \
+            'document:' + update.message.document.file_id
+
+    update.message.reply_text("Add more info or send /cancel if you're done.",
+                              reply_markup=CAT_KEYBOARD)
+
+    return EDIT
+
+@db_session
 def add_admin(bot, update):
     global state
-    with db_session:
-        admin = get_admin(update.message.from_user)
+    admin = get_admin(update.message.from_user)
+
     if not admin or not admin.super_admin:
-        return
-    state[update.message.chat_id] = ADD_ADMIN
-    bot.sendMessage(update.message.chat_id,
-                    text="Forward me a message of the user you want to add"
-                         " as admin or send /cancel to cancel",
-                    reply_to_message_id=update.message.message_id)
+        return ConversationHandler.END
+
+    update.message.reply_text(
+        "Forward me a message of the user you want to add as admin or send /cancel to cancel")
+
+    return ADD
 
 
+@db_session
+def add_admin_2(bot, update):
+    forward_from = update.message.forward_from
+    admin = get_admin(forward_from)
+
+    if not admin:
+        Admin(id=forward_from.id,
+              first_name=forward_from.first_name,
+              last_name=forward_from.last_name,
+              username=forward_from.username)
+        update.message.reply_text("Successfully added admin")
+
+    else:
+        update.message.reply_text("This user is already an admin")
+
+    return ConversationHandler.END
+
+
+@db_session
 def remove_admin(bot, update):
-    global state
-    with db_session:
-        admin = get_admin(update.message.from_user)
+    admin = get_admin(update.message.from_user)
+
     if not admin or not admin.super_admin:
-        return
-    state[update.message.chat_id] = REMOVE_ADMIN
-    bot.sendMessage(update.message.chat_id,
-                    text="Forward me a message of the admin you want to remove"
-                         " or send /cancel to cancel",
-                    reply_to_message_id=update.message.message_id)
+        return ConversationHandler.END
+
+    update.message.reply_text(
+        "Forward me a message of the admin you want to remove or send /cancel to cancel")
+
+    return ADD
+
+
+@db_session
+def remove_admin_2(bot, update):
+    admin = get_admin(update.message.forward_from)
+
+    if admin and not admin.super_admin:
+        admin.delete()
+        update.message.reply_text("Successfully removed admin")
+    else:
+        update.message.reply_text("This user is not an admin")
 
 
 def cancel(bot, update):
-    try:
-        del state[update.message.chat_id]
-    finally:
-        bot.sendMessage(update.message.chat_id,
-                        text="Current operation canceled",
-                        reply_markup=ReplyKeyboardHide(),
-                        reply_to_message_id=update.message.message_id)
+    update.message.reply_text("Current operation canceled", reply_markup=ReplyKeyboardHide())
+    return ConversationHandler.END
 
 
-def search(bot, update):
-    global state
-    state[update.message.chat_id] = (SEARCH, datetime.now())
-    bot.sendMessage(update.message.chat_id,
-                    text="Enter search query:",
-                    reply_markup=ForceReply(selective=True),
-                    reply_to_message_id=update.message.message_id)
+def search(bot, update, user_data):
+    user_data['search_time'] = datetime.now()
+
+    update.message.reply_text("Enter search query:", reply_markup=ForceReply(selective=True))
+
+    return WAIT
+
+
+@db_session
+def search_2(bot, update, user_data):
+    issued = user_data['search_time']
+    if (datetime.now() - issued).seconds > 30:
+        update.message.reply_text("Please send your /search query within 30 seconds.")
+
+    else:
+        text = update.message.text.replace('%', '')
+
+        believers = select(
+            s for s in Believer if
+            text in s.phone_nr or
+            text in s.account_nr or
+            text in s.bank_name or
+            text in s.remark
+        ).order_by(
+            desc(Believer.created)
+        )[0:1]
+
+        if believers:
+            believer = believers[0]
+            reporter = get_reporter(update.message.from_user)
+
+            kb = search_keyboard(offset=0,
+                                 show_download=True,
+                                 disabled_attachments=[],
+                                 confirmed=reporter in believer.reported_by
+                                 if reporter
+                                 else False,
+                                 query=text)
+
+            update.message.reply_text(str(believer),
+                                      reply_markup=InlineKeyboardMarkup(kb),
+                                      parse_mode=ParseMode.HTML)
+
+        else:
+            update.message.reply_text("No search results")
+
+        track(update, 'search')
+
+    return ConversationHandler.END
 
 
 @db_session
@@ -475,12 +499,12 @@ def callback_query(bot, update):
             confirmed = reporter in believer.reported_by if reporter else False
 
         else:
-            bot.answerCallbackQuery(callback_query_id=cb.id, text="No more results")
+            update.callback_query.answer("No more results")
             return
 
     elif action == 'confirm':
         if not believers:
-            bot.answerCallbackQuery(callback_query_id=cb.id, text="Not found, please search again")
+            update.callback_query.answer("Not found, please search again")
             return
 
         believer = believers[0]
@@ -493,17 +517,17 @@ def callback_query(bot, update):
                 track(update, 'new_reporter')
 
             believer.reported_by.add(reporter)
-            bot.answerCallbackQuery(callback_query_id=cb.id, text="You confirmed this report.")
+            update.callback_query.answer("You confirmed this report.")
         else:
             believer.reported_by.remove(reporter)
-            bot.answerCallbackQuery(callback_query_id=cb.id, text="You removed your confirmation.")
+            update.callback_query.answer("You removed your confirmation.")
 
         confirmed = not confirmed
         reply = str(believer)
 
     elif action == 'att':
         if not believers:
-            bot.answerCallbackQuery(callback_query_id=cb.id, text="Not found, please search again")
+            update.callback_query.answer("Not found, please search again")
             return
 
         kind, _, file_id = believers[0].attached_file.partition(':')
@@ -600,33 +624,95 @@ def search_keyboard(offset, show_download, disabled_attachments, confirmed, quer
     return kb
 
 
+@db_session
 def download_db(bot, update):
-    chat_id = update.message.chat_id
     global state
-    with db_session:
-        admin = get_admin(update.message.from_user)
+    admin = get_admin(update.message.from_user)
+
     if not admin or not admin.super_admin:
         return
-    bot.sendChatAction(chat_id, action=ChatAction.UPLOAD_DOCUMENT)
-    bot.sendDocument(chat_id, document=open(DB_NAME, 'rb'),
-                     filename='trustworthy.sqlite',
-                     reply_to_message_id=update.message.message_id)
+
+    update.message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+    update.message.reply_document(open(DB_NAME, 'rb'), filename='trustworthy.sqlite')
 
 
 # Add all handlers to the dispatcher and run the bot
 dp.add_handler(CommandHandler('start', help))
 dp.add_handler(CommandHandler('help', help))
-dp.add_handler(CommandHandler('add_admin', add_admin))
-dp.add_handler(CommandHandler('remove_admin', remove_admin))
-dp.add_handler(CommandHandler('new', add_believer))
-dp.add_handler(CommandHandler('edit', edit_believer))
-dp.add_handler(CommandHandler('delete', remove_believer))
-dp.add_handler(CommandHandler('search', search))
 dp.add_handler(CallbackQueryHandler(callback_query))
 dp.add_handler(CommandHandler('download_database', download_db))
-dp.add_handler(CommandHandler('cancel', cancel))
-dp.add_handler(MessageHandler([Filters.text, Filters.photo, Filters.document],
-                             message_handler))
+
+cancel_handler = CommandHandler('cancel', cancel)
+select_option_handler = MessageHandler([Filters.text], select_option, pass_user_data=True)
+edit_option_dict = {
+    PHONE_NR: [MessageHandler([Filters.text], edit_phone_nr, pass_user_data=True)],
+    ACCOUNT_NR: [MessageHandler([Filters.text], edit_account_nr, pass_user_data=True)],
+    BANK_NAME: [MessageHandler([Filters.text], edit_bank_name, pass_user_data=True)],
+    REMARK: [MessageHandler([Filters.text], edit_remark, pass_user_data=True)],
+    ATTACHMENT: [MessageHandler([Filters.photo, Filters.document],
+                                edit_attachment,
+                                pass_user_data=True)],
+}
+
+conv_add_admin = ConversationHandler(
+    entry_points=[CommandHandler('add_admin', add_admin)],
+    states={
+        ADD: [MessageHandler([Filters.forwarded], add_admin_2)],
+    },
+    fallbacks=[cancel_handler]
+)
+
+conv_remove_admin = ConversationHandler(
+    entry_points=[CommandHandler('remove_admin', remove_admin)],
+    states={
+        REMOVE: [MessageHandler([Filters.forwarded], remove_admin_2)],
+    },
+    fallbacks=[cancel_handler]
+)
+
+conv_search = ConversationHandler(
+    entry_points=[CommandHandler('search', search, pass_user_data=True)],
+    states={
+        WAIT: [MessageHandler([Filters.text], search_2, pass_user_data=True)],
+    },
+    fallbacks=[cancel_handler]
+)
+
+conv_add_believer = ConversationHandler(
+    entry_points=[CommandHandler('new', add_believer)],
+    states={
+        ADD: [MessageHandler([Filters.forwarded], add_believer_2, pass_user_data=True)],
+        EDIT: [select_option_handler],
+        **edit_option_dict,
+    },
+    fallbacks=[cancel_handler]
+)
+
+conv_remove_believer = ConversationHandler(
+    entry_points=[CommandHandler('delete', remove_believer)],
+    states={
+        REMOVE: [MessageHandler([Filters.forwarded], remove_believer_2, pass_user_data=True)],
+    },
+    fallbacks=[cancel_handler]
+)
+
+conv_edit = ConversationHandler(
+    entry_points=[CommandHandler('edit', edit_believer)],
+    states={
+        WAIT: [RegexHandler(r'^\d+$', edit_believer_2, pass_user_data=True)],
+        EDIT: [select_option_handler],
+        **edit_option_dict,
+    },
+    fallbacks=[cancel_handler]
+)
+
+dp.add_handler(conv_add_admin)
+dp.add_handler(conv_remove_admin)
+dp.add_handler(conv_edit)
+dp.add_handler(conv_search)
+dp.add_handler(conv_add_believer)
+dp.add_handler(conv_remove_believer)
+
 dp.addErrorHandler(error)
 
 start_bot(u)
